@@ -31,23 +31,55 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
+def parse_stage_report(reply, role):
+    """Read a complete stage decision, allowing a plain JSON fence or one missing comma."""
+    routes = {
+        "registration": ("specialist_consultation",),
+        "specialist_consultation": ("diagnostic_test", "end_of_diagnosis"),
+    }
+    for match in re.finditer(r"```(json|)[ \t\r\n]*(\{.*?)```", reply, re.DOTALL | re.IGNORECASE):
+        label, body = match.groups()
+        label = label.strip().lower()
+        if label not in ("", "json"):
+            continue
+        body = body.strip()
+        try:
+            report = json.loads(body)
+        except json.JSONDecodeError as error:
+            # Only insert a separator at the decoder's failure position, before a known key.
+            if (error.msg != "Expecting ',' delimiter"
+                    or not body[:error.pos].rstrip().endswith('"')
+                    or not re.match(r'"(?:clinic_note|suggestion|next_step)"\s*:', body[error.pos:])):
+                continue
+            try:
+                report = json.loads(body[:error.pos] + "," + body[error.pos:])
+            except json.JSONDecodeError:
+                continue
+        if (isinstance(report, dict)
+                and all(isinstance(report.get(k), str) and report[k].strip()
+                        for k in ("clinic_note", "suggestion", "next_step"))
+                and report["next_step"] in routes[role]):
+            return report
+    return None
+
+
 def talk_with_doctor(args: "Args", context: "RunContext", doctor_role: str, encounter_turns: int) -> bool:
     """
     Manages a single interaction encounter between the Patient Agent and a Doctor Agent.
-    
+
     Args:
         args: Configuration arguments.
         context: Runtime context containing history contents.
         doctor_role: The specific role of the doctor.
         encounter_turns: The current count of encounters in the pipeline.
-        
+
     Returns:
         bool: True if the interaction finished successfully (reached a conclusion or completed tests), False if max turns exceeded.
     """
-    
+
     # --- Initialize Doctor Agent ---
     assert doctor_role in Prompts.roles
-    
+
     # Configure the Doctor Agent based on the role.
     # Specialists get access to external tools (if configured), while others might not.
     if doctor_role == "specialist_consultation":
@@ -75,41 +107,41 @@ def talk_with_doctor(args: "Args", context: "RunContext", doctor_role: str, enco
             llm_model=args.doctor_model_name,
             responses_api=args.doctor_responses_api
         )
-    
+
     # --- Branch: Diagnostic Testing Phase ---
     # If the current role is 'diagnostic_test', we simulate running medical tests instead of a conversation.
     if doctor_role == "diagnostic_test":
         task = str(context.patient_records[-1]["suggestion"])
-        
+
         # 1. Identify required tests.
         test_itemize_agent = PatientAgent(llm_client=context.patient_agent.llm_client, llm_model=args.patient_model_name)
         test_itemize_agent.history_messages = []
         tests = test_itemize_agent.chat(Prompts.prompts[doctor_role]["itemize"].replace("INSERT_TESTS_HERE", task))
         tests = re.findall(r"```json(.*?)```", tests, flags=re.DOTALL)[0].strip()
         tests = json.loads(tests)
-        
+
         # 2. Define helper to simulate a single test execution.
         def mimic_test(test_name: str):
             test_agent = PatientAgent(llm_client=context.patient_client, llm_model=args.patient_model_name)
             test_instruction = Prompts.prompts[doctor_role]["test"].replace("INSERT_TEST_HERE", test_name).replace("INSERT_CASE_HERE", context.patient_agent.whole_case)
             result = test_agent.chat(test_instruction)
-            
+
             # # (Optional) Generate a formal report from the raw result by the Doctor.
             # report_agent = DoctorAgent(llm_client=context.doctor_client, llm_model=args.doctor_model_name)
             # report_instruction = Prompts.prompts[doctor_role]["report"].replace("INSERT_REPORT_HERE", result)
             # report = report_agent.chat(report_instruction)
-            
+
             context.diagnosis_reports.append({
                 "test_name": test_name,
                 "test_result": result,
                 # "test_report": report
             })
             logger.info(f"\n--- {doctor_role} ---:  {context.diagnosis_reports[-1]}\n")
-            
+
         # 3. Execute tests concurrently to simulate parallel lab work.
         with ThreadPoolExecutor(max_workers = 8) as executor:
             list(executor.map(mimic_test, tests))
-        
+
         # 4. Record the completed tests in the patient records.
         context.patient_records.append({
             "Recording Department": "diagnostic_test",
@@ -119,7 +151,7 @@ def talk_with_doctor(args: "Args", context: "RunContext", doctor_role: str, enco
             "Recording Department": "diagnostic_test",
             "Completed Tests": str(tests)
         })
-        
+
         # 5. Log the interaction as a encounter turn.
         context.doctor_patient_diaglogues.append({
             "encounter_turn": encounter_turns,
@@ -127,22 +159,30 @@ def talk_with_doctor(args: "Args", context: "RunContext", doctor_role: str, enco
             "diaglogue": str(tests)
         })
         return True
-        
+
+    def chat_with_tools(message, turn_record):
+        tool_usage_info = []
+        try:
+            return doctor_agent.chat(
+                message, tool_usage_info, doctor_role == "specialist_consultation"
+            )
+        finally:
+            if tool_usage_info:
+                turn_record["tool"] = tool_usage_info.copy()
+                for tool_info in tool_usage_info:
+                    tool_info["encounter_turn"] = encounter_turns
+                    context.tool_usages.append(tool_info)
+
     # --- Branch: Interactive Dialogue Phase ---
     # Main loop for conversation between Doctor and Patient.
     now_diaglogue = []
     for i in range(args.max_talk_turns+3):
-        
-        # Determine if the doctor is allowed to call tools (only specialists).
-        tool_call = False
-        if doctor_role == "specialist_consultation":
-            tool_call = True
-        
+
         # Initialize storage for the current turn's dialogue data.
         now_talkturn_diaglogue = {}
         # logger.info(f"\n--- now_diaglogue --- \n{now_diaglogue}\n")
         # logger.info(f"\n--- {doctor_role} --- turns {i+1} start!\n")
-            
+
         # --- First Turn & Initial Persona Setup ---
         if i == 0:
             if doctor_role == "registration":
@@ -150,14 +190,19 @@ def talk_with_doctor(args: "Args", context: "RunContext", doctor_role: str, enco
             elif doctor_role == "specialist_consultation":
                 instruction = Prompts.prompts[doctor_role]["doctor"].replace("INSERT_QUERYNUMS_HERE", str(args.max_query_nums)).replace("INSERT_TURNS_HERE",str(args.max_talk_turns))
                 instruction = instruction.replace("INSERT_DEPARTMENT_HERE", context.patient_records[1]["suggestion"]).replace("INSERT_RECORD_HERE", str(context.patient_records_simplified))
+                if context.state_memory_enabled:
+                    instruction += context.build_doctor_memory(encounter_turns, args.max_encounter_nums)
             logger.info(f"\n--- {doctor_role} --- doctor_prompt ---:  {instruction}\n")
-            
+
             # Generate the Doctor's opening statement.
-            doctor_talk = doctor_agent.chat(instruction)
+            if context.state_memory_enabled and doctor_role == "specialist_consultation":
+                doctor_talk = chat_with_tools(instruction, now_talkturn_diaglogue)
+            else:
+                doctor_talk = doctor_agent.chat(instruction)
             now_talkturn_diaglogue["turn"] = i + 1
             now_talkturn_diaglogue["doctor"] = doctor_talk
             logger.info(f"\n---{doctor_role} --- doctor_talk---:  {doctor_talk}\n")
-            
+
             # Clean up internal 'Thought' processes (<think> tags) before showing text to the Patient Agent.
             if "<think>" in doctor_talk and "</think>" in doctor_talk:
                 doctor_talk_to_patient = re.sub('<think>.*</think>', '', doctor_talk, flags=re.DOTALL).strip()
@@ -167,26 +212,25 @@ def talk_with_doctor(args: "Args", context: "RunContext", doctor_role: str, enco
                 doctor_talk_to_patient = doctor_talk
 
             # Check if the doctor has reached a conclusion immediately (Rare but possible in Turn 1).
-            if re.search(r"```json(.*?)```", doctor_talk_to_patient, flags=re.DOTALL):
-                report = re.findall(r"```json(.*?)```", doctor_talk_to_patient, flags=re.DOTALL)[0].strip()
-                report = json.loads(report)
+            report = parse_stage_report(doctor_talk_to_patient, doctor_role)
+            if report is not None:
 
                 report.update({"Recording Department": doctor_role})
                 context.patient_records.append(report)
-                
+
                 report_simplified = {
                     "Recording Department": doctor_role,
                     "Clinic Note": report["clinic_note"]
                 }
                 context.patient_records_simplified.append(report_simplified)
-                
+
                 now_diaglogue.append(now_talkturn_diaglogue)
                 context.doctor_patient_diaglogues.append({
                     "encounter_turn": encounter_turns,
                     "department": doctor_role,
                     "diaglogue": now_diaglogue
                 })
-                
+
                 # If diagnosis is complete, generate the final discharge summary.
                 if report["next_step"] == "end_of_diagnosis":
                     result = doctor_agent.chat(Prompts.prompts["end_of_diagnosis"])
@@ -198,7 +242,7 @@ def talk_with_doctor(args: "Args", context: "RunContext", doctor_role: str, enco
                         "treatment_plan": result["treatment_plan"]
                     })
                 return True
-            
+
             # Generate Patient's response to the opening statement.
             if doctor_role == "registration":
                 instruction = Prompts.prompts[doctor_role]["patient"].replace("INSERT_QUERY_HERE", doctor_talk_to_patient)
@@ -210,20 +254,18 @@ def talk_with_doctor(args: "Args", context: "RunContext", doctor_role: str, enco
                 # logger.info(f"\n--- {doctor_role} --- patient_prompt ---:  {instruction}\n")
             now_talkturn_diaglogue["patient"] = patient_talk
             logger.info(f"\n--- patient_talk ---:  {patient_talk}\n")
-            
+
         # --- Subsequent Dialogue Turns ---
         else:
-            now_tool_usage_info = []
-            doctor_talk = doctor_agent.chat(patient_talk, now_tool_usage_info, tool_call)
+            doctor_message = patient_talk
+            if context.state_memory_enabled and doctor_role == "specialist_consultation":
+                doctor_message += context.build_doctor_memory(
+                    encounter_turns, args.max_encounter_nums, include_report_text=False
+                )
+            doctor_talk = chat_with_tools(doctor_message, now_talkturn_diaglogue)
 
             now_talkturn_diaglogue["turn"] = i + 1
-            
-            # Record tool usage if any occurred.
-            if now_tool_usage_info:
-                now_talkturn_diaglogue["tool"] = now_tool_usage_info.copy()
-                for tool_info in now_tool_usage_info:
-                    tool_info["encounter_turn"] = encounter_turns
-                    context.tool_usages.append(tool_info)
+
             now_talkturn_diaglogue["doctor"] = doctor_talk
             logger.info(f"\n--- {doctor_role} --- doctor_talk ---:  {doctor_talk}\n")
 
@@ -234,28 +276,27 @@ def talk_with_doctor(args: "Args", context: "RunContext", doctor_role: str, enco
                 doctor_talk_to_patient = re.sub('<seed:think>.*</seed:think>', '', doctor_talk, flags=re.DOTALL).strip()
             else:
                 doctor_talk_to_patient = doctor_talk
-    
+
             # Check if Doctor has output a JSON conclusion.
-            if re.search(r"```json(.*?)```", doctor_talk_to_patient, flags=re.DOTALL):
-                report = re.findall(r"```json(.*?)```", doctor_talk_to_patient, flags=re.DOTALL)[0].strip()
-                report = json.loads(report)
+            report = parse_stage_report(doctor_talk_to_patient, doctor_role)
+            if report is not None:
 
                 report.update({"Recording Department": doctor_role})
                 context.patient_records.append(report)
-                
+
                 report_simplified = {
                     "Recording Department": doctor_role,
                     "Clinic Note": report["clinic_note"]
                 }
                 context.patient_records_simplified.append(report_simplified)
-                
+
                 now_diaglogue.append(now_talkturn_diaglogue)
                 context.doctor_patient_diaglogues.append({
                     "encounter_turn": encounter_turns,
                     "department": doctor_role,
                     "diaglogue": now_diaglogue
                 })
-                
+
                 # If diagnosis is complete, generate the final discharge summary.
                 if report["next_step"] == "end_of_diagnosis":
                     result = doctor_agent.chat(Prompts.prompts["end_of_diagnosis"])
@@ -267,30 +308,30 @@ def talk_with_doctor(args: "Args", context: "RunContext", doctor_role: str, enco
                         "treatment_plan": result["treatment_plan"]
                     })
                 return True
-            
+
             # If no conclusion, the Patient responds to continue the dialogue.
             patient_talk = context.patient_agent.chat(doctor_talk_to_patient)
             now_talkturn_diaglogue["patient"] = patient_talk
             logger.info(f"\n--- patient_talk ---:  {patient_talk}\n")
-            
+
         now_diaglogue.append(now_talkturn_diaglogue)
-        
+
     logger.info("\n------- Out of current diaglogues! --------\n")
     return False
     # raise ValueError("Exceeded dialogue turn limit.")
-  
+
 
 def run_pipeline(args: "Args", context: "RunContext") -> "RunContext":
     """
     Orchestrates the entire simulation pipeline for a specific medical case.
     Initializes agents, tools, and manages the lifecycle of encounters.
     """
-    
+
     # --- Register Patient Agent ---
     # Construct case information string for the agent's context.
     known_case = f"Case Information: {context.data_item['Case Information']}\n\nPhysical Examination: {context.data_item['Physical Examination']}"
     whole_case = f"Case Information: {context.data_item['Case Information']}\n\nPhysical Examination: {context.data_item['Physical Examination']}\n\nDiagnostic Tests: {context.data_item['Diagnostic Tests']}\n\nFinal Diagnosis: {context.data_item['Final Diagnosis']}"
-    
+
     patient_client = OpenAI(
         base_url=args.patient_base_url,
         api_key=args.patient_api_key
@@ -303,14 +344,14 @@ def run_pipeline(args: "Args", context: "RunContext") -> "RunContext":
     )
     context.patient_client = patient_client
     context.patient_agent = patient_agent
-    
+
     # --- Register Doctor Client ---
     doctor_client = OpenAI(
         base_url=args.doctor_base_url,
         api_key=args.doctor_api_key
     )
     context.doctor_client = doctor_client
-    
+
     # --- Initialize Medical Record Systems ---
     # Initialize lists to track the progression of the case.
     context.patient_records = [{
@@ -324,11 +365,13 @@ def run_pipeline(args: "Args", context: "RunContext") -> "RunContext":
     context.diagnosis_reports = []
     context.tool_usages = []
     context.doctor_patient_diaglogues = []
-    
+    context.state_memory_enabled = getattr(args, "state_memory", False)
+    context.retrieved_report_indices.clear()
+
     # --- Register Tools ---
     tool_manager = ToolManager()
     tools_instance = Tools(args, context)
-    
+
     # Bind specific tools to the manager (e.g., PubMed, Wikipedia).
     tool_manager.register_tool(tools_instance.get_info)
     tool_manager.register_tool(tools_instance.search_wikipedia)
@@ -337,11 +380,11 @@ def run_pipeline(args: "Args", context: "RunContext") -> "RunContext":
     context.tool_manager = tool_manager
     # logger.info(f"\n --- tool schema --- \n{tool_manager.get_tools_json()}\n")
     # logger.info(f"\n --- tool schema --- \n{tool_manager.get_tools_json_responses_api()}\n")
-    
+
     # --- Simulate Medical Encounter Process ---
     encounter_turns = 1
     now_doctor_role = "registration" # Starting point: Registration desk
-    
+
     while encounter_turns <= args.max_encounter_nums:
         # Attempt to run the encounter logic.
         try:
@@ -350,7 +393,7 @@ def run_pipeline(args: "Args", context: "RunContext") -> "RunContext":
             print(f"\n--- ERROR DETECTED in worker thread of data {context.data_item['id']}---")
             traceback.print_exc()
             print("---------------------------------------------------\n")
-            
+
             context.process_success = False
             return context
 
@@ -358,7 +401,7 @@ def run_pipeline(args: "Args", context: "RunContext") -> "RunContext":
         if not s:
             context.process_success = False
             return context
-        
+
         # Check the result of the encounter to determine the next step.
         record = context.patient_records[-1]
         if record["Recording Department"] == "end_of_diagnosis":
@@ -367,17 +410,15 @@ def run_pipeline(args: "Args", context: "RunContext") -> "RunContext":
         else:
             # Determine next department: If currently testing, go to Specialist, otherwise follow the doctor's referral.
             now_doctor_role = "specialist_consultation" if now_doctor_role == "diagnostic_test" else record["next_step"]
-        
+
         logger.info(f"\n--- {encounter_turns}th dialogue---")
         logger.info(f"\n--- next department --- {now_doctor_role}\n")
         logger.info(f"\n--- patient_records ---:  {context.patient_records}\n")
         logger.info(f"\n--- patient_records_simplified ---:  {context.patient_records_simplified}\n")
         logger.info(f"\n--- diagnosis_reports ---:  {context.diagnosis_reports}\n")
-        
+
         encounter_turns += 1
-        
+
     # If the loop finishes without reaching "end_of_diagnosis", mark as failure.
     context.process_success = False
     return context
-        
-    

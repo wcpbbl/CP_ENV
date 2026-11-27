@@ -28,6 +28,8 @@ class Args:
         parser.add_argument("--case_count", type=int, default=1,
                             help="Number of cases to select from the start of the test split.")
         parser.add_argument("--case_ids", type=int, nargs="+", help="Run selected dataset IDs within case_count.")
+        parser.add_argument("--plan_handoff", action="store_true",
+                            help="Carry clinical questions and decisions between encounters.")
         parser.add_argument("--state_memory", action="store_true",
                             help="Enable cross-encounter memory and completed/retrieved test tracking.")
 
@@ -71,6 +73,8 @@ class Args:
         os.makedirs("./outputs", exist_ok=True)
         self.run_suffix = "-state-memory" if self.state_memory else ""
         self.run_suffix += "-stage-fix"
+        if self.plan_handoff:
+            self.run_suffix += "-plan-handoff-triage-fix"
         if self.case_ids:
             self.run_suffix += "-ids-" + "-".join(map(str, sorted(set(self.case_ids))))
         self.output_path = f"./outputs/P_{self.patient_model_name}-D_{self.doctor_model_name}{self.run_suffix}-results.jsonl"

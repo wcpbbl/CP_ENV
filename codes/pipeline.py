@@ -63,6 +63,43 @@ def parse_stage_report(reply, role):
     return None
 
 
+PLAN_INSTRUCTION = {
+    "registration": (
+        "When writing your usual stage JSON, add a string field care_plan. In one "
+        "sentence state the reported clue motivating this referral and the question "
+        "for the specialist. Do not invent a diagnosis. Keep suggestion as the department."
+    ),
+    "specialist_consultation": (
+        "Use the latest Care Plan in the record as the previous clinician's provisional "
+        "question. Update it using only patient answers and evidence actually available "
+        "to you. At handoff, add a string field care_plan to your usual stage JSON. "
+        "In one or two sentences say what is resolved or still open, and why. If ordering "
+        "tests, say which pending decision they will inform. At final handoff, state the "
+        "decision and any remaining uncertainty. Keep actual orders in suggestion."
+    ),
+}
+
+
+def replace_premature_referral(doctor, turn):
+    """Keep both the doctor history and the patient-facing transcript on the intake question."""
+    question = "What is the main symptom or concern that brings you here today?"
+    doctor.history_messages[-1] = {"role": "assistant", "content": question}
+    turn["doctor"] = question
+    turn["premature_referral_blocked"] = True
+    return question
+
+
+def record_handoff(context, role, report, include_plan):
+    summary = {"Recording Department": role, "Clinic Note": report["clinic_note"]}
+    if include_plan:
+        plan = report.get("care_plan")
+        if isinstance(plan, str) and plan.strip():
+            summary["Care Plan"] = plan.strip()
+    report["Recording Department"] = role
+    context.patient_records.append(report)
+    context.patient_records_simplified.append(summary)
+
+
 def talk_with_doctor(args: "Args", context: "RunContext", doctor_role: str, encounter_turns: int) -> bool:
     """
     Manages a single interaction encounter between the Patient Agent and a Doctor Agent.
@@ -175,6 +212,9 @@ def talk_with_doctor(args: "Args", context: "RunContext", doctor_role: str, enco
 
     # --- Branch: Interactive Dialogue Phase ---
     # Main loop for conversation between Doctor and Patient.
+    guarded_triage = args.plan_handoff and doctor_role == "registration"
+    has_patient_reply = False
+    plan_prompt_sent = False
     now_diaglogue = []
     for i in range(args.max_talk_turns+3):
 
@@ -192,6 +232,13 @@ def talk_with_doctor(args: "Args", context: "RunContext", doctor_role: str, enco
                 instruction = instruction.replace("INSERT_DEPARTMENT_HERE", context.patient_records[1]["suggestion"]).replace("INSERT_RECORD_HERE", str(context.patient_records_simplified))
                 if context.state_memory_enabled:
                     instruction += context.build_doctor_memory(encounter_turns, args.max_encounter_nums)
+            if guarded_triage:
+                instruction += (
+                    "\nThe patient has not spoken yet. For this opening turn, "
+                    "ask the patient about their main symptom. Wait for their answer."
+                )
+            elif args.plan_handoff:
+                instruction += "\n\n" + PLAN_INSTRUCTION[doctor_role]
             logger.info(f"\n--- {doctor_role} --- doctor_prompt ---:  {instruction}\n")
 
             # Generate the Doctor's opening statement.
@@ -213,16 +260,12 @@ def talk_with_doctor(args: "Args", context: "RunContext", doctor_role: str, enco
 
             # Check if the doctor has reached a conclusion immediately (Rare but possible in Turn 1).
             report = parse_stage_report(doctor_talk_to_patient, doctor_role)
+            if guarded_triage and not has_patient_reply and report is not None:
+                doctor_talk_to_patient = replace_premature_referral(doctor_agent, now_talkturn_diaglogue)
+                report = None
             if report is not None:
 
-                report.update({"Recording Department": doctor_role})
-                context.patient_records.append(report)
-
-                report_simplified = {
-                    "Recording Department": doctor_role,
-                    "Clinic Note": report["clinic_note"]
-                }
-                context.patient_records_simplified.append(report_simplified)
+                record_handoff(context, doctor_role, report, args.plan_handoff)
 
                 now_diaglogue.append(now_talkturn_diaglogue)
                 context.doctor_patient_diaglogues.append({
@@ -257,7 +300,10 @@ def talk_with_doctor(args: "Args", context: "RunContext", doctor_role: str, enco
 
         # --- Subsequent Dialogue Turns ---
         else:
-            doctor_message = patient_talk
+            doctor_message = patient_talk or ""
+            if guarded_triage and has_patient_reply and not plan_prompt_sent:
+                doctor_message += "\n\n[Registration instructions] " + PLAN_INSTRUCTION["registration"]
+                plan_prompt_sent = True
             if context.state_memory_enabled and doctor_role == "specialist_consultation":
                 doctor_message += context.build_doctor_memory(
                     encounter_turns, args.max_encounter_nums, include_report_text=False
@@ -279,16 +325,12 @@ def talk_with_doctor(args: "Args", context: "RunContext", doctor_role: str, enco
 
             # Check if Doctor has output a JSON conclusion.
             report = parse_stage_report(doctor_talk_to_patient, doctor_role)
+            if guarded_triage and not has_patient_reply and report is not None:
+                doctor_talk_to_patient = replace_premature_referral(doctor_agent, now_talkturn_diaglogue)
+                report = None
             if report is not None:
 
-                report.update({"Recording Department": doctor_role})
-                context.patient_records.append(report)
-
-                report_simplified = {
-                    "Recording Department": doctor_role,
-                    "Clinic Note": report["clinic_note"]
-                }
-                context.patient_records_simplified.append(report_simplified)
+                record_handoff(context, doctor_role, report, args.plan_handoff)
 
                 now_diaglogue.append(now_talkturn_diaglogue)
                 context.doctor_patient_diaglogues.append({
@@ -314,6 +356,8 @@ def talk_with_doctor(args: "Args", context: "RunContext", doctor_role: str, enco
             now_talkturn_diaglogue["patient"] = patient_talk
             logger.info(f"\n--- patient_talk ---:  {patient_talk}\n")
 
+        if guarded_triage and isinstance(patient_talk, str) and patient_talk.strip():
+            has_patient_reply = True
         now_diaglogue.append(now_talkturn_diaglogue)
 
     logger.info("\n------- Out of current diaglogues! --------\n")
